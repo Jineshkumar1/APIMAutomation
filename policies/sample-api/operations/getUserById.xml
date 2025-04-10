@@ -1,0 +1,22 @@
+<policies>
+    <inbound>
+        <base />
+        <cache-lookup vary-by-developer="false" vary-by-developer-groups="false" downstream-caching-type="none" caching-type="internal">
+            <vary-by-header>Accept</vary-by-header>
+            <vary-by-value>@(context.Request.MatchedParameters["userId"])</vary-by-value>
+        </cache-lookup>
+        <set-header name="X-Operation-Type" exists-action="override">
+            <value>UserDetails</value>
+        </set-header>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+        <cache-store duration="60" />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

@@ -1,0 +1,5 @@
+{
+  "sample-api": ["developers", "internal-apps", "sandbox"],
+  "my-api": ["developers", "partners"],
+  "another-api": ["premium", "partners"]
+}

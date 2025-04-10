@@ -1,0 +1,67 @@
+name: API Definition Validation
+
+on:
+  pull_request:
+    paths:
+      - 'apis/**/*.json'
+      - 'apis/**/*.yaml'
+      - 'apis/**/*.yml'
+  workflow_dispatch:
+
+jobs:
+  validate-api-specs:
+    name: Validate OpenAPI Specifications
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      # Install Node.js for running validation tools
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          
+      # Install Spectral for OpenAPI linting
+      - name: Install Spectral
+        run: npm install -g @stoplight/spectral-cli
+        
+      # Run Spectral to lint OpenAPI files
+      - name: Lint OpenAPI specs
+        run: |
+          for file in $(find ./apis -name "*.json" -o -name "*.yaml" -o -name "*.yml"); do
+            echo "Validating $file"
+            spectral lint "$file" --ruleset .spectral.yaml
+          done
+        # The .spectral.yaml file should be in the repo root with custom linting rules
+        
+      # Validate OpenAPI files using a validator tool
+      - name: Validate OpenAPI specs
+        run: |
+          npm install -g @apidevtools/swagger-cli
+          for file in $(find ./apis -name "*.json" -o -name "*.yaml" -o -name "*.yml"); do
+            echo "Validating $file"
+            swagger-cli validate "$file"
+          done
+          
+      # Optional: Generate and post API documentation preview comment on PR
+      - name: Generate API Documentation Preview
+        if: github.event_name == 'pull_request'
+        run: |
+          npm install -g redoc-cli
+          mkdir -p ./preview-docs
+          for file in $(find ./apis -name "*.json" -o -name "*.yaml" -o -name "*.yml"); do
+            api_name=$(basename "$file" | cut -d. -f1)
+            redoc-cli bundle -o "./preview-docs/$api_name.html" "$file"
+          done
+          
+      # Upload documentation preview as artifact
+      - name: Upload documentation preview
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-documentation-preview
+          path: ./preview-docs
+          retention-days: 7

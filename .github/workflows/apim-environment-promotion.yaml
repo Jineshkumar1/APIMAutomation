@@ -1,0 +1,233 @@
+name: Propagate APIs Between Environments
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_environment:
+        description: 'Source environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+      target_environment:
+        description: 'Target environment'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - qa
+          - prod
+      apis:
+        description: 'APIs to propagate (comma-separated, leave blank for all)'
+        required: false
+        type: string
+      include_revisions:
+        description: 'Include API revisions'
+        type: boolean
+        default: true
+      include_policies:
+        description: 'Include API policies'
+        type: boolean
+        default: true
+
+jobs:
+  extract-and-propagate:
+    name: Extract and Propagate APIs
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_environment }}
+    
+    steps:
+      # Login to Azure
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      # Checkout the repository to store extracted configurations
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      # Define environment variables based on inputs
+      - name: Set environment variables
+        id: vars
+        run: |
+          # Set APIM service names based on environment
+          if [ "${{ inputs.source_environment }}" == "dev" ]; then
+            echo "SOURCE_APIM_NAME=apim-cms-dev-use2" >> $GITHUB_OUTPUT
+            echo "SOURCE_RG=rg-cms-apim-dev-use2" >> $GITHUB_OUTPUT
+          elif [ "${{ inputs.source_environment }}" == "qa" ]; then
+            echo "SOURCE_APIM_NAME=apim-cms-qa-use2" >> $GITHUB_OUTPUT
+            echo "SOURCE_RG=rg-cms-apim-qa-use2" >> $GITHUB_OUTPUT
+          fi
+          
+          if [ "${{ inputs.target_environment }}" == "qa" ]; then
+            echo "TARGET_APIM_NAME=apim-cms-qa-use2" >> $GITHUB_OUTPUT
+            echo "TARGET_RG=rg-cms-apim-qa-use2" >> $GITHUB_OUTPUT
+          elif [ "${{ inputs.target_environment }}" == "prod" ]; then
+            echo "TARGET_APIM_NAME=apim-cms-prod-use2" >> $GITHUB_OUTPUT
+            echo "TARGET_RG=rg-cms-apim-prod-use2" >> $GITHUB_OUTPUT
+          fi
+      
+      # Extract APIs from source environment
+      - name: Extract APIs from source
+        id: extract_apis
+        run: |
+          mkdir -p ./extracted-apis
+          
+          # Determine which APIs to extract
+          if [ -n "${{ github.event.inputs.apis }}" ]; then
+            API_LIST=$(echo "${{ github.event.inputs.apis }}" | tr ',' ' ')
+            echo "Using specified APIs: $API_LIST"
+          else
+            # Get all APIs from source environment
+            API_LIST=$(az apim api list \
+              --resource-group ${{ steps.vars.outputs.SOURCE_RG }} \
+              --service-name ${{ steps.vars.outputs.SOURCE_APIM_NAME }} \
+              --query "[].name" -o tsv)
+            echo "Using all APIs: $API_LIST"
+          fi
+          
+          echo "api_list<<EOF" >> $GITHUB_OUTPUT
+          
+          # Extract each API
+          for api in $API_LIST; do
+            echo "Extracting API $api from ${{ steps.vars.outputs.SOURCE_APIM_NAME }}"
+            
+            # Export API spec to file
+            az apim api export \
+              --resource-group ${{ steps.vars.outputs.SOURCE_RG }} \
+              --service-name ${{ steps.vars.outputs.SOURCE_APIM_NAME }} \
+              --api-id "$api" \
+              --format "OpenApiJson" \
+              --output-file "./extracted-apis/${api}.json"
+            
+            if [ "${{ inputs.include_policies }}" == "true" ]; then
+              # Export API policies
+              mkdir -p "./extracted-apis/${api}/policies"
+              
+              # Get API-level policy
+              az apim api policy show \
+                --resource-group ${{ steps.vars.outputs.SOURCE_RG }} \
+                --service-name ${{ steps.vars.outputs.SOURCE_APIM_NAME }} \
+                --api-id "$api" \
+                --format rawxml > "./extracted-apis/${api}/policies/policy.xml" || echo "No API-level policy found for $api"
+              
+              # Get operation policies
+              mkdir -p "./extracted-apis/${api}/policies/operations"
+              
+              # Get list of operations
+              operations=$(az apim api operation list \
+                --resource-group ${{ steps.vars.outputs.SOURCE_RG }} \
+                --service-name ${{ steps.vars.outputs.SOURCE_APIM_NAME }} \
+                --api-id "$api" \
+                --query "[].name" -o tsv)
+              
+              for operation in $operations; do
+                az apim api operation policy show \
+                  --resource-group ${{ steps.vars.outputs.SOURCE_RG }} \
+                  --service-name ${{ steps.vars.outputs.SOURCE_APIM_NAME }} \
+                  --api-id "$api" \
+                  --operation-id "$operation" \
+                  --format rawxml > "./extracted-apis/${api}/policies/operations/${operation}.xml" || echo "No policy for operation $operation"
+              done
+            fi
+            
+            # Add API to the list
+            echo "$api" >> $GITHUB_OUTPUT
+          done
+          
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      # Deploy APIs to target environment
+      - name: Deploy APIs to target
+        run: |
+          for api in ${{ steps.extract_apis.outputs.api_list }}; do
+            echo "Deploying API $api to ${{ steps.vars.outputs.TARGET_APIM_NAME }}"
+            
+            # Get API details from source for additional properties
+            api_details=$(az apim api show \
+              --resource-group ${{ steps.vars.outputs.SOURCE_RG }} \
+              --service-name ${{ steps.vars.outputs.SOURCE_APIM_NAME }} \
+              --api-id "$api")
+            
+            api_path=$(echo "$api_details" | jq -r '.path')
+            display_name=$(echo "$api_details" | jq -r '.displayName')
+            api_version=$(echo "$api_details" | jq -r '.apiVersion // "1.0"')
+            
+            # Import API to target environment
+            az apim api import \
+              --resource-group ${{ steps.vars.outputs.TARGET_RG }} \
+              --service-name ${{ steps.vars.outputs.TARGET_APIM_NAME }} \
+              --path "$api_path" \
+              --api-id "$api" \
+              --display-name "$display_name" \
+              --api-version "$api_version" \
+              --specification-format "OpenApiJson" \
+              --specification-path "./extracted-apis/${api}.json"
+            
+            # Apply policies if included
+            if [ "${{ inputs.include_policies }}" == "true" ]; then
+              # Apply API-level policy if exists
+              if [ -f "./extracted-apis/${api}/policies/policy.xml" ] && [ -s "./extracted-apis/${api}/policies/policy.xml" ]; then
+                echo "Applying API policy for $api"
+                az apim api policy create \
+                  --resource-group ${{ steps.vars.outputs.TARGET_RG }} \
+                  --service-name ${{ steps.vars.outputs.TARGET_APIM_NAME }} \
+                  --api-id "$api" \
+                  --value "@./extracted-apis/${api}/policies/policy.xml"
+              fi
+              
+              # Apply operation policies
+              for operation_policy in $(find ./extracted-apis/${api}/policies/operations -name "*.xml" 2>/dev/null); do
+                if [ -f "$operation_policy" ] && [ -s "$operation_policy" ]; then
+                  operation_name=$(basename "$operation_policy" .xml)
+                  echo "Applying operation policy for $api/$operation_name"
+                  az apim api operation policy create \
+                    --resource-group ${{ steps.vars.outputs.TARGET_RG }} \
+                    --service-name ${{ steps.vars.outputs.TARGET_APIM_NAME }} \
+                    --api-id "$api" \
+                    --operation-id "$operation_name" \
+                    --value "@$operation_policy"
+                fi
+              done
+            fi
+            
+            # Maintain product assignments
+            products=$(az apim product api list \
+              --resource-group ${{ steps.vars.outputs.SOURCE_RG }} \
+              --service-name ${{ steps.vars.outputs.SOURCE_APIM_NAME }} \
+              --api-id "$api" \
+              --query "[].name" -o tsv)
+            
+            for product in $products; do
+              echo "Adding API $api to product $product"
+              az apim product api add \
+                --resource-group ${{ steps.vars.outputs.TARGET_RG }} \
+                --service-name ${{ steps.vars.outputs.TARGET_APIM_NAME }} \
+                --product-id "$product" \
+                --api-id "$api" || echo "Failed to add to product $product - may not exist in target"
+            done
+          done
+      
+      # Validate the deployment
+      - name: Validate deployment
+        run: |
+          echo "Validating deployment to ${{ steps.vars.outputs.TARGET_APIM_NAME }}..."
+          
+          for api in ${{ steps.extract_apis.outputs.api_list }}; do
+            # Check if API exists in target
+            api_exists=$(az apim api show \
+              --resource-group ${{ steps.vars.outputs.TARGET_RG }} \
+              --service-name ${{ steps.vars.outputs.TARGET_APIM_NAME }} \
+              --api-id "$api" \
+              --query "name" -o tsv 2>/dev/null || echo "")
+            
+            if [ -n "$api_exists" ]; then
+              echo "✅ API $api successfully deployed to ${{ steps.vars.outputs.TARGET_APIM_NAME }}"
+            else
+              echo "❌ API $api failed to deploy to ${{ steps.vars.outputs.TARGET_APIM_NAME }}"
+              exit 1
+            fi
+          done

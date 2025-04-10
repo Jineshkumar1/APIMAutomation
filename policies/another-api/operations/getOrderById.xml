@@ -1,0 +1,23 @@
+<policies>
+    <inbound>
+        <base />
+        <cache-lookup vary-by-developer="false" vary-by-developer-groups="false" downstream-caching-type="none" caching-type="internal">
+            <vary-by-header>Accept</vary-by-header>
+            <vary-by-value>@(context.Request.MatchedParameters["orderId"])</vary-by-value>
+        </cache-lookup>
+        <set-backend-service base-url="https://orders-api.example.com/v2" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+        <cache-store duration="300" />
+        <set-header name="X-Cache-TTL" exists-action="override">
+            <value>300</value>
+        </set-header>
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

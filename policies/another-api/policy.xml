@@ -1,0 +1,43 @@
+<policies>
+    <inbound>
+        <base />
+        <cors>
+            <allowed-origins>
+                <origin>https://portal.example.com</origin>
+                <origin>https://admin.example.com</origin>
+            </allowed-origins>
+            <allowed-methods>
+                <method>GET</method>
+                <method>POST</method>
+                <method>PUT</method>
+                <method>DELETE</method>
+            </allowed-methods>
+            <allowed-headers>
+                <header>Content-Type</header>
+                <header>Authorization</header>
+                <header>Ocp-Apim-Subscription-Key</header>
+            </allowed-headers>
+        </cors>
+        <validate-jwt header-name="Authorization" require-scheme="Bearer" failed-validation-error-message="Invalid JWT token">
+            <openid-config url="https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration" />
+            <required-claims>
+                <claim name="aud" match="any">
+                    <value>api://orders-service</value>
+                </claim>
+            </required-claims>
+        </validate-jwt>
+        <set-header name="X-API-Version" exists-action="override">
+            <value>2.1.0</value>
+        </set-header>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+        <json-to-xml apply="content-type-xml" consider-accept-header="true" />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

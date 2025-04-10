@@ -1,0 +1,166 @@
+name: Deploy APIs to Azure APIM
+
+on:
+  push:
+    branches: [ develop, main ]
+    paths:
+      - 'apis/**/*.json'
+      - 'apis/**/*.yaml'
+      - 'apis/**/*.yml'
+      - 'policies/**/*.xml'
+  workflow_dispatch:
+    inputs:
+      api_name:
+        description: 'Specific API to deploy (leave blank for all)'
+        required: false
+        type: string
+      
+env:
+  # Update these values to match your environment
+  AZURE_APIM_SERVICE_NAME: "apim-cms-dev-use2"
+  AZURE_RESOURCE_GROUP: "rg-cms-apim-dev-use2"
+
+jobs:
+  deploy-to-apim:
+    name: Deploy APIs to APIM
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      # Login to Azure
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          
+      # Install APIM DevOps toolkit
+      - name: Setup APIM DevOps toolkit
+        run: |
+          npm install -g @azure/api-management-devops-resource-kit
+          
+      # Install AzCLI extensions for APIM
+      - name: Install AzCLI Extensions
+        run: |
+          az extension add --name api-management
+          
+      # Extract APIs to deploy
+      - name: Determine APIs to deploy
+        id: determine_apis
+        run: |
+          if [ -n "${{ github.event.inputs.api_name }}" ]; then
+            echo "Deploying specific API: ${{ github.event.inputs.api_name }}"
+            echo "api_list=${{ github.event.inputs.api_name }}" >> $GITHUB_OUTPUT
+          else
+            # Get list of all APIs that have changed
+            APIS=$(find ./apis -name "*.json" -o -name "*.yaml" -o -name "*.yml" | xargs basename -s .json -s .yaml -s .yml | sort -u | tr '\n' ' ')
+            echo "Deploying APIs: $APIS"
+            echo "api_list=$APIS" >> $GITHUB_OUTPUT
+          fi
+      
+      # Deploy APIs to APIM
+      - name: Deploy APIs to APIM
+        run: |
+          # Loop through each API and deploy
+          for api in ${{ steps.determine_apis.outputs.api_list }}; do
+            echo "Deploying API: $api"
+            
+            # Find the API definition file
+            api_file=$(find ./apis -name "${api}.*" | head -n 1)
+            
+            if [ -z "$api_file" ]; then
+              echo "Error: Could not find definition file for API: $api"
+              exit 1
+            fi
+            
+            echo "Found API file: $api_file"
+            
+            # Extract API version from the file
+            api_version=$(grep -o '"version":\s*"[^"]*"' "$api_file" | cut -d'"' -f4 || echo "1.0")
+            echo "API version: $api_version"
+            
+            # Create or update API in APIM
+            az apim api import \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --service-name ${{ env.AZURE_APIM_SERVICE_NAME }} \
+              --api-id "$api" \
+              --path "/$api" \
+              --display-name "$api" \
+              --api-version "$api_version" \
+              --specification-format "OpenApi" \
+              --specification-path "$api_file"
+            
+            # Apply policies if they exist
+            if [ -f "./policies/${api}/policy.xml" ]; then
+              echo "Applying API policy for $api"
+              az apim api policy create \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --service-name ${{ env.AZURE_APIM_SERVICE_NAME }} \
+                --api-id "$api" \
+                --value "@./policies/${api}/policy.xml"
+            fi
+            
+            # Apply operation policies if they exist
+            for operation_policy in $(find ./policies/${api}/operations -name "*.xml" 2>/dev/null || echo ""); do
+              if [ -f "$operation_policy" ]; then
+                operation_name=$(basename "$operation_policy" .xml)
+                echo "Applying operation policy for $api/$operation_name"
+                az apim api operation policy create \
+                  --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                  --service-name ${{ env.AZURE_APIM_SERVICE_NAME }} \
+                  --api-id "$api" \
+                  --operation-id "$operation_name" \
+                  --value "@$operation_policy"
+              fi
+            done
+          done
+      
+      # Update API product assignments if needed
+      - name: Assign APIs to Products
+        run: |
+          for api in ${{ steps.determine_apis.outputs.api_list }}; do
+            # Check if API product mapping exists
+            if [ -f "./config/api-products.json" ]; then
+              # Extract products for this API from config
+              products=$(jq -r --arg api "$api" '.[$api] | join(" ")' ./config/api-products.json)
+              
+              if [ -n "$products" ] && [ "$products" != "null" ]; then
+                echo "Assigning API $api to products: $products"
+                for product in $products; do
+                  az apim product api add \
+                    --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                    --service-name ${{ env.AZURE_APIM_SERVICE_NAME }} \
+                    --product-id "$product" \
+                    --api-id "$api"
+                done
+              fi
+            fi
+          done
+      
+      # Test API endpoints (basic smoke test)
+      - name: Test API Endpoints
+        run: |
+          # Get subscription key for testing
+          sub_key=$(az apim subscription list \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --service-name ${{ env.AZURE_APIM_SERVICE_NAME }} \
+            --query "[?state=='active'].primaryKey" -o tsv | head -n 1)
+          
+          for api in ${{ steps.determine_apis.outputs.api_list }}; do
+            echo "Testing API: $api"
+            
+            # Check if API is online
+            status_code=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://${{ env.AZURE_APIM_SERVICE_NAME }}.azure-api.net/$api" \
+              -H "Ocp-Apim-Subscription-Key: $sub_key" \
+              -H "Ocp-Apim-Trace: true")
+            
+            echo "API $api returned status code: $status_code"
+            if [[ "$status_code" == "401" || "$status_code" == "404" || "$status_code" == "200" || "$status_code" == "403" ]]; then
+              echo "API $api is accessible"
+            else
+              echo "Warning: API $api might have issues. Status code: $status_code"
+            fi
+          done
