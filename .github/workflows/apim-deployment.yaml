@@ -16,7 +16,8 @@ on:
         type: string
       
 env:
-  # Update these values to match your environment
+  # Set environment variables for Azure resources. 
+  # These should be updated to match your Azure environment.
   AZURE_APIM_SERVICE_NAME: "apim-cms-dev-use2"
   AZURE_RESOURCE_GROUP: "rg-cms-apim-dev-use2"
 
@@ -26,48 +27,58 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # Checkout the repository
+      # Step 1: Checkout the repository so workflow can access the code and API definitions.
       - name: Checkout repository
         uses: actions/checkout@v4
         
-      # Login to Azure
+      # Step 2: Authenticate with Azure using credentials stored in repository secrets.
+      # This allows subsequent az CLI commands to interact with your Azure resources.
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
           
-      # Install APIM DevOps toolkit
+      # Step 3: Install the APIM DevOps toolkit globally.
+      # This toolkit provides helpful utilities for managing Azure API Management resources as code.
       - name: Setup APIM DevOps toolkit
         run: |
           npm install -g @azure/api-management-devops-resource-kit
+          # Improvement: Consider caching npm packages to speed up workflow runs.
           
-      # Install AzCLI extensions for APIM
+      # Step 4: Install Azure CLI extension for API Management.
+      # This enables advanced APIM commands within the az CLI.
       - name: Install AzCLI Extensions
         run: |
           az extension add --name api-management
+          # Improvement: Use 'az extension update' if already installed.
           
-      # Extract APIs to deploy
+      # Step 5: Determine which APIs need to be deployed.
+      # If triggered manually with an api_name, deploy only that API.
+      # Otherwise, deploy all APIs that exist in the apis/ directory.
       - name: Determine APIs to deploy
         id: determine_apis
         run: |
           if [ -n "${{ github.event.inputs.api_name }}" ]; then
+            # Deploying a specific API as requested by workflow_dispatch input.
             echo "Deploying specific API: ${{ github.event.inputs.api_name }}"
             echo "api_list=${{ github.event.inputs.api_name }}" >> $GITHUB_OUTPUT
           else
-            # Get list of all APIs that have changed
+            # Find all unique API definitions (by file name, without extension) to deploy.
             APIS=$(find ./apis -name "*.json" -o -name "*.yaml" -o -name "*.yml" | xargs basename -s .json -s .yaml -s .yml | sort -u | tr '\n' ' ')
             echo "Deploying APIs: $APIS"
             echo "api_list=$APIS" >> $GITHUB_OUTPUT
           fi
+          # Improvement: Consider filtering only APIs that actually changed in the commit (using git diff).
       
-      # Deploy APIs to APIM
+      # Step 6: Deploy each API to Azure APIM.
+      # For each API, import the spec and apply policies if they exist.
       - name: Deploy APIs to APIM
         run: |
-          # Loop through each API and deploy
+          # Loop through each API in the list and deploy it.
           for api in ${{ steps.determine_apis.outputs.api_list }}; do
             echo "Deploying API: $api"
             
-            # Find the API definition file
+            # Find the first matching API definition file (json/yaml/yml).
             api_file=$(find ./apis -name "${api}.*" | head -n 1)
             
             if [ -z "$api_file" ]; then
@@ -77,11 +88,11 @@ jobs:
             
             echo "Found API file: $api_file"
             
-            # Extract API version from the file
+            # Extract the API version from the file. Defaults to "1.0" if not found.
             api_version=$(grep -o '"version":\s*"[^"]*"' "$api_file" | cut -d'"' -f4 || echo "1.0")
             echo "API version: $api_version"
             
-            # Create or update API in APIM
+            # Import or update the API in Azure API Management.
             az apim api import \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --service-name ${{ env.AZURE_APIM_SERVICE_NAME }} \
@@ -92,7 +103,7 @@ jobs:
               --specification-format "OpenApi" \
               --specification-path "$api_file"
             
-            # Apply policies if they exist
+            # Apply a global API policy if policy.xml exists for this API.
             if [ -f "./policies/${api}/policy.xml" ]; then
               echo "Applying API policy for $api"
               az apim api policy create \
@@ -102,7 +113,7 @@ jobs:
                 --value "@./policies/${api}/policy.xml"
             fi
             
-            # Apply operation policies if they exist
+            # Apply operation-specific policies if they exist.
             for operation_policy in $(find ./policies/${api}/operations -name "*.xml" 2>/dev/null || echo ""); do
               if [ -f "$operation_policy" ]; then
                 operation_name=$(basename "$operation_policy" .xml)
@@ -116,14 +127,16 @@ jobs:
               fi
             done
           done
+          # Improvement: Add error handling/reporting if deployment fails for any API.
       
-      # Update API product assignments if needed
+      # Step 7: Assign APIs to products if a mapping exists.
+      # This uses a config file to determine which APIs belong to which products.
       - name: Assign APIs to Products
         run: |
           for api in ${{ steps.determine_apis.outputs.api_list }}; do
-            # Check if API product mapping exists
+            # If a product mapping config exists, use jq to extract product assignments.
             if [ -f "./config/api-products.json" ]; then
-              # Extract products for this API from config
+              # Get products for this API (expects an array in JSON).
               products=$(jq -r --arg api "$api" '.[$api] | join(" ")' ./config/api-products.json)
               
               if [ -n "$products" ] && [ "$products" != "null" ]; then
@@ -138,11 +151,13 @@ jobs:
               fi
             fi
           done
+          # Improvement: Log a warning if the config file is missing or malformed.
       
-      # Test API endpoints (basic smoke test)
+      # Step 8: Smoke test API endpoints to verify deployment.
+      # This basic test checks if the API responds with expected HTTP status codes.
       - name: Test API Endpoints
         run: |
-          # Get subscription key for testing
+          # Get a subscription key for testing (assumes at least one active subscription).
           sub_key=$(az apim subscription list \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --service-name ${{ env.AZURE_APIM_SERVICE_NAME }} \
@@ -151,7 +166,7 @@ jobs:
           for api in ${{ steps.determine_apis.outputs.api_list }}; do
             echo "Testing API: $api"
             
-            # Check if API is online
+            # Make a test request to the API endpoint.
             status_code=$(curl -s -o /dev/null -w "%{http_code}" \
               "https://${{ env.AZURE_APIM_SERVICE_NAME }}.azure-api.net/$api" \
               -H "Ocp-Apim-Subscription-Key: $sub_key" \
@@ -164,3 +179,4 @@ jobs:
               echo "Warning: API $api might have issues. Status code: $status_code"
             fi
           done
+          # Improvement: Enhance testing by sending sample requests from example files or OpenAPI examples.
